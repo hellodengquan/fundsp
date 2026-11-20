@@ -759,3 +759,218 @@ fn test_sequencer_loop() {
         assert_eq!(output, 0.0);
     }
 }
+
+/// Render a mono node with `tick`, one sample at a time.
+fn render_oversampled_tick(node: &mut dyn AudioUnit, input: &[f32]) -> Vec<f32> {
+    let mut output = [0.0];
+    input
+        .iter()
+        .map(|&x| {
+            node.tick(&[x], &mut output);
+            output[0]
+        })
+        .collect()
+}
+
+/// Render a mono node with `process` using the given repeating block length pattern.
+fn render_oversampled_process(
+    node: &mut dyn AudioUnit,
+    input: &[f32],
+    sizes: &[usize],
+) -> Vec<f32> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut in_buffer = BufferArray::<U1>::new();
+    let mut out_buffer = BufferArray::<U1>::new();
+    let mut i = 0;
+    let mut size_index = 0;
+    while i < input.len() {
+        let n = min(sizes[size_index % sizes.len()], input.len() - i);
+        size_index += 1;
+        for k in 0..n {
+            in_buffer.set_f32(0, k, input[i + k]);
+        }
+        node.process(n, &in_buffer.buffer_ref(), &mut out_buffer.buffer_mut());
+        for k in 0..n {
+            output.push(out_buffer.at_f32(0, k));
+        }
+        i += n;
+    }
+    output
+}
+
+/// Test that the 2x oversampler produces identical output whether rendered sample by
+/// sample or in blocks, including odd block lengths and mixed block lengths.
+#[test]
+fn test_oversample_block_processing() {
+    let length = 1500;
+    let input: Vec<f32> = (0..length)
+        .map(|i| {
+            let t = i as f32;
+            (t * 0.017).sin() * 0.7 + (t * 0.31).sin() * 0.2
+        })
+        .collect();
+
+    for sizes in [
+        &[64usize][..],
+        &[63],
+        &[57],
+        &[37],
+        &[1],
+        &[32],
+        &[2],
+        &[1, 57, 64, 63, 8, 32, 3, 7],
+    ] {
+        let mut tick_node = oversample(lowpass_hz(1000.0, 1.0));
+        tick_node.set_sample_rate(DEFAULT_SR);
+        let tick_output = render_oversampled_tick(&mut tick_node, &input);
+
+        let mut process_node = oversample(lowpass_hz(1000.0, 1.0));
+        process_node.set_sample_rate(DEFAULT_SR);
+        let process_output = render_oversampled_process(&mut process_node, &input, sizes);
+
+        let tolerance = 1.0e-4;
+        for i in 0..length {
+            assert!(
+                (tick_output[i] - process_output[i]).abs() <= tolerance,
+                "block sizes {sizes:?} differ at sample {i}: tick {} process {}",
+                tick_output[i],
+                process_output[i]
+            );
+        }
+    }
+}
+
+/// Test that the oversampler reports latency in outer samples, including the group delay
+/// of the interpolation and decimation filters, and that the inner node's latency is
+/// converted from inner (2x) samples to outer samples.
+#[test]
+fn test_oversample_latency() {
+    let sample_rate = DEFAULT_SR;
+
+    // The filter chain alone contributes a latency of roughly 40 outer samples.
+    let mut pass_oversampler = oversample(pass());
+    pass_oversampler.set_sample_rate(sample_rate);
+    let filter_latency = pass_oversampler.latency().unwrap();
+    assert!(
+        filter_latency > 39.0 && filter_latency < 41.0,
+        "filter latency {filter_latency}"
+    );
+
+    // A limiter with 0.01 s lookahead has a latency of 441 samples at the outer rate
+    // and 882 samples at the inner rate. Oversampled, that becomes 441 outer samples
+    // plus the filter chain latency.
+    let mut limiter_oversampler = oversample(limiter(0.01, 0.01));
+    limiter_oversampler.set_sample_rate(sample_rate);
+    let limiter_latency = limiter_oversampler.latency().unwrap();
+    let expected = 441.0 + filter_latency;
+    assert!(
+        (limiter_latency - expected).abs() < 1.0,
+        "limiter latency {limiter_latency} expected {expected}"
+    );
+
+    // Check the latency against the impulse response centroid.
+    let mut impulse_source = oversample(pass());
+    impulse_source.set_sample_rate(sample_rate);
+    let mut impulse = vec![0.0f32; 256];
+    impulse[0] = 1.0;
+    let response = render_oversampled_tick(&mut impulse_source, &impulse);
+    let sum: f64 = response.iter().map(|&x| x as f64).sum();
+    let centroid: f64 = response
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| i as f64 * x as f64)
+        .sum::<f64>()
+        / sum;
+    assert!(
+        (centroid - filter_latency).abs() < 0.1,
+        "centroid {centroid} latency {filter_latency}"
+    );
+}
+
+/// Test that the oversampler's reported frequency response includes the magnitude and
+/// phase of the interpolation and decimation filters.
+#[test]
+fn test_oversample_response() {
+    let sample_rate = DEFAULT_SR;
+    let mut node = oversample(pass());
+    node.set_sample_rate(sample_rate);
+
+    let mut impulse = vec![0.0f32; 256];
+    impulse[0] = 1.0;
+    let response = render_oversampled_tick(&mut node, &impulse);
+
+    for &frequency in &[50.0, 100.0, 500.0, 1000.0, 5000.0, 15000.0] {
+        let reported = node.response(0, frequency).unwrap();
+        let omega = f64::TAU * frequency / sample_rate;
+        let mut real = 0.0;
+        let mut imaginary = 0.0;
+        for (i, &x) in response.iter().enumerate() {
+            let phase = -omega * i as f64;
+            real += x as f64 * phase.cos();
+            imaginary += x as f64 * phase.sin();
+        }
+        let measured = Complex64::new(real, imaginary);
+        assert!(
+            (reported - measured).norm() < 1.0e-3,
+            "at {frequency} Hz reported {reported} measured {measured}"
+        );
+    }
+}
+
+/// Test that resetting, or changing to another sample rate, restores the same timeline
+/// so that output can be realigned by the reported latency.
+#[test]
+fn test_oversample_reset() {
+    let sample_rate = DEFAULT_SR;
+    let input: Vec<f32> = (0..400)
+        .map(|i| (i as f32 * 0.05).sin() * 0.5 + (i as f32 * 0.13).cos() * 0.3)
+        .collect();
+
+    let mut node = oversample(pass());
+    node.set_sample_rate(sample_rate);
+    let _ = render_oversampled_tick(&mut node, &input[..100]);
+    node.reset();
+    let after_reset = render_oversampled_tick(&mut node, &input);
+
+    let mut fresh = oversample(pass());
+    fresh.set_sample_rate(sample_rate);
+    let expected = render_oversampled_tick(&mut fresh, &input);
+
+    for i in 0..input.len() {
+        assert!(
+            (after_reset[i] - expected[i]).abs() <= 1.0e-6,
+            "sample {i} differs after reset"
+        );
+    }
+
+    let mut changed_rate = oversample(pass());
+    changed_rate.set_sample_rate(48000.0);
+    changed_rate.reset();
+    let changed = render_oversampled_tick(&mut changed_rate, &input);
+
+    let mut fresh_48k = oversample(pass());
+    fresh_48k.set_sample_rate(48000.0);
+    let expected_48k = render_oversampled_tick(&mut fresh_48k, &input);
+
+    for i in 0..input.len() {
+        assert!(
+            (changed[i] - expected_48k[i]).abs() <= 1.0e-6,
+            "sample {i} differs after sample rate change"
+        );
+    }
+
+    // Changing the sample rate alone must also give a clean timeline: after processing
+    // some samples at the old rate, switching rate and rendering must match a fresh node
+    // at the new rate without an explicit reset.
+    let mut switched = oversample(pass());
+    switched.set_sample_rate(sample_rate);
+    let _ = render_oversampled_tick(&mut switched, &input[..100]);
+    switched.set_sample_rate(48000.0);
+    let switched_output = render_oversampled_tick(&mut switched, &input);
+    for i in 0..input.len() {
+        assert!(
+            (switched_output[i] - expected_48k[i]).abs() <= 1.0e-6,
+            "sample {i} differs after switching sample rate"
+        );
+    }
+}

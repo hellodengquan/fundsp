@@ -75,6 +75,48 @@ where
     outv: Frame<Frame<f32, U128>, X::Outputs>,
     input_rb_index: usize,
     output_rb_index: usize,
+    sample_rate: f64,
+}
+
+/// Group delay of the interpolation and decimation filters in outer samples.
+/// The interpolation and decimation stages each contribute the group delay of the
+/// halfband filter at DC, which is the delay of the whole oversampling layer
+/// (the inner node's own latency is added on top of this in `route`).
+fn filter_latency() -> f64 {
+    let mut even_sum = 0.0;
+    let mut odd_sum = 0.0;
+    let mut even_delay = 0.0;
+    let mut odd_delay = 0.0;
+    for d in 0..=HALFBAND_MIN_LEN / 2 {
+        let w = HALFBAND_MIN[d * 2] as f64;
+        even_sum += w;
+        even_delay += (HALFBAND_MIN_LEN / 2 - d) as f64 * w;
+    }
+    for t in 0..HALFBAND_MIN_LEN / 2 {
+        let w = HALFBAND_MIN[t * 2 + 1] as f64;
+        odd_sum += w;
+        odd_delay += (HALFBAND_MIN_LEN / 2 - 1 - t) as f64 * w;
+    }
+    even_delay / even_sum + odd_delay / odd_sum
+}
+
+/// Frequency response of the interpolation and decimation filters at `omega`,
+/// the outer sample rate angular frequency (radians per outer sample).
+/// The interpolation stage produces even and odd inner samples with responses
+/// `even` and `odd`, and the cascade with the decimation stage has response
+/// `even * odd` at the outer rate.
+fn filter_response(omega: f64) -> Complex64 {
+    let mut even = Complex64::new(0.0, 0.0);
+    for d in 0..=HALFBAND_MIN_LEN / 2 {
+        let phase = -omega * (HALFBAND_MIN_LEN / 2 - d) as f64;
+        even += Complex64::from_polar(2.0 * HALFBAND_MIN[d * 2] as f64, phase);
+    }
+    let mut odd = Complex64::new(0.0, 0.0);
+    for t in 0..HALFBAND_MIN_LEN / 2 {
+        let phase = -omega * (HALFBAND_MIN_LEN / 2 - 1 - t) as f64;
+        odd += Complex64::from_polar(2.0 * HALFBAND_MIN[t * 2 + 1] as f64, phase);
+    }
+    even * odd
 }
 
 impl<X> Oversampler<X>
@@ -97,6 +139,7 @@ where
             outv: Frame::default(),
             input_rb_index: 0,
             output_rb_index: 0,
+            sample_rate,
         }
     }
 
@@ -127,11 +170,25 @@ where
         self.x.reset();
         self.inv = Frame::default();
         self.outv = Frame::default();
+        self.input_rb_index = 0;
+        self.output_rb_index = 0;
     }
 
     fn set_sample_rate(&mut self, sample_rate: f64) {
+        if self.sample_rate == sample_rate {
+            // Sample rate is unchanged, so maintain current state.
+            return;
+        }
+        self.sample_rate = sample_rate;
         let inner_sr = sample_rate * 2.0;
         self.x.set_sample_rate(inner_sr);
+        // The delay of the filter chain is defined in outer samples and does not depend on
+        // the sample rate. Clear the filter history so that the reported timeline is exact
+        // from the next sample on, regardless of the previous sample rate.
+        self.inv = Frame::default();
+        self.outv = Frame::default();
+        self.input_rb_index = 0;
+        self.output_rb_index = 0;
     }
 
     #[inline]
@@ -174,9 +231,15 @@ where
         let mut inner_input: BufferArray<Self::Inputs> = BufferArray::new();
         let mut inner_output: BufferArray<Self::Outputs> = BufferArray::new();
 
-        for offset in [0, size / 2] {
-            // interpolate into input buffer (half of input)
-            for i in 0..size / 2 {
+        // Process in chunks of up to half a buffer so that the interpolated inner block
+        // fits in a buffer (2 * 32 = 64 samples). Any block length is supported, including
+        // odd lengths: every input sample is interpolated and every output sample is written.
+        let mut offset = 0;
+        while offset < size {
+            let chunk = min(size - offset, MAX_BUFFER_SIZE / 2);
+
+            // Interpolate `chunk` input samples into twice as many inner samples.
+            for i in 0..chunk {
                 for channel in 0..Self::Inputs::USIZE {
                     self.inv[channel][self.input_rb_index] = input.at_f32(channel, i + offset);
 
@@ -188,16 +251,17 @@ where
                 self.input_rb_index = (self.input_rb_index + 1) & 0x7f;
             }
 
-            // process
+            // The inner node advances at twice the outer sample rate, so it processes
+            // exactly the 2 * `chunk` samples that were interpolated above.
             self.x.process(
-                size,
+                chunk * 2,
                 &(inner_input.buffer_ref()),
                 &mut inner_output.buffer_mut(),
             );
 
-            // decimate into output buffer (half of output)
-            for i in 0..size / 2 {
-                for channel in 0..Self::Inputs::USIZE {
+            // Decimate into output buffer.
+            for i in 0..chunk {
+                for channel in 0..Self::Outputs::USIZE {
                     self.outv[channel][self.output_rb_index] = inner_output.at_f32(channel, i * 2);
                     let next_output_index = (self.output_rb_index + 1) & 0x7f;
                     self.outv[channel][next_output_index] = inner_output.at_f32(channel, i * 2 + 1);
@@ -208,11 +272,39 @@ where
 
                 self.output_rb_index = (self.output_rb_index + 2) & 0x7f;
             }
+
+            offset += chunk;
         }
     }
 
     fn route(&mut self, input: &SignalFrame, frequency: f64) -> SignalFrame {
-        self.x.route(input, frequency)
+        // The inner node runs at twice the outer sample rate. It reports latency in inner
+        // samples, which are half the length of outer samples. The interpolation and
+        // decimation filters add their own group delay and magnitude/phase response.
+        let omega = if self.sample_rate > 0.0 {
+            f64::TAU * frequency / self.sample_rate
+        } else {
+            0.0
+        };
+        let extra_latency = filter_latency();
+        let extra_response = filter_response(omega);
+        let inner = self.x.route(input, frequency);
+        let mut output = SignalFrame::new(self.outputs());
+        for i in 0..self.outputs() {
+            output.set(
+                i,
+                match inner.at(i) {
+                    // A filtered constant is not constant from time zero because the filter
+                    // chain has a start-up transient, matching the other filters' routing.
+                    Signal::Latency(latency) => Signal::Latency(latency * 0.5 + extra_latency),
+                    Signal::Response(response, latency) => {
+                        Signal::Response(response * extra_response, latency * 0.5 + extra_latency)
+                    }
+                    _ => Signal::Unknown,
+                },
+            );
+        }
+        output
     }
 
     fn ping(&mut self, probe: bool, hash: AttoHash) -> AttoHash {

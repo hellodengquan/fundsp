@@ -13,6 +13,7 @@ use super::signal::*;
 use super::vertex::*;
 use super::*;
 use alloc::boxed::Box;
+use alloc::vec;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
@@ -138,6 +139,13 @@ pub struct Net {
     backend_outputs: usize,
     /// Queue of smooth edits made to nodes. Applicable to frontends only.
     edit_queue: Vec<NodeEdit>,
+    /// Whether branch delay compensation is enabled.
+    /// When enabled, signals joining the same mix point are sample-aligned
+    /// by delaying the less-latent branches.
+    delay_compensation: bool,
+    /// Branch delay compensation line for each global output channel.
+    /// Allocated on the control thread so that the audio thread never allocates.
+    output_delay: Vec<DelayComp>,
     /// Revision number. This is used by frontends and backends only.
     /// The revision is incremented after each commit.
     revision: u64,
@@ -161,6 +169,8 @@ impl Clone for Net {
             backend_outputs: self.backend_outputs,
             // Edit queue belongs to the frontend and is never cloned.
             edit_queue: Vec::new(),
+            delay_compensation: self.delay_compensation,
+            output_delay: self.output_delay.clone(),
             revision: self.revision,
             error: self.error.clone(),
         }
@@ -192,6 +202,8 @@ impl Net {
             backend_inputs: inputs,
             backend_outputs: outputs,
             edit_queue: Vec::new(),
+            delay_compensation: false,
+            output_delay: (0..outputs).map(|_| DelayComp::new(0)).collect(),
             revision: 0,
             error: None,
         };
@@ -211,6 +223,68 @@ impl Net {
             self.determine_order();
         }
         &self.error
+    }
+
+    /// Enable or disable branch delay compensation.
+    ///
+    /// When enabled, signals that merge at the same mix point (vertex inputs
+    /// sourced from different branches, and global outputs of the network)
+    /// are synchronized by delaying the branches with less processing
+    /// latency behind the most latent one. This prevents the comb filtering
+    /// that results from a dry signal reaching a mix point before the
+    /// processed, wet signal. Relative phase relationships between the
+    /// channels of each branch are preserved, as every channel of a branch
+    /// is delayed by the same whole-sample amount.
+    ///
+    /// Compensation delays are calculated from the latencies reported by
+    /// the contained units and are rounded to whole samples.
+    /// The latency and frequency response reported by the network
+    /// (see `AudioUnit::latency` and `AudioUnit::response`) describe the
+    /// compensated sound, so discarding the reported pre-delay in offline
+    /// rendering restores the correct starting point.
+    ///
+    /// All compensation buffers are preallocated when the network is
+    /// committed or allocated. The audio thread performs no allocation
+    /// when the effective graph changes; the new compensation is applied
+    /// atomically at the next graph commit.
+    ///
+    /// When disabled (the default), mixing behaves exactly as before:
+    /// branches are summed without any added delay.
+    pub fn set_delay_compensation(&mut self, enabled: bool) {
+        if self.delay_compensation != enabled {
+            self.delay_compensation = enabled;
+            self.invalidate_order();
+        }
+    }
+
+    /// Return whether branch delay compensation is currently enabled.
+    pub fn delay_compensation(&self) -> bool {
+        self.delay_compensation
+    }
+
+    /// Return the whole-sample compensation delay currently applied to
+    /// input `channel` of `node`, or zero if compensation is disabled or
+    /// the input does not need to be delayed.
+    /// Network topology is (re)computed if necessary.
+    pub fn input_compensation(&mut self, node: NodeId, channel: usize) -> usize {
+        if !self.is_ordered() {
+            self.determine_order();
+        }
+        let index = self.node_index[&node];
+        assert!(channel < self.vertex[index].inputs());
+        self.vertex[index].input_delay[channel].delay()
+    }
+
+    /// Return the whole-sample compensation delay currently applied to
+    /// global output `channel`, or zero if compensation is disabled or
+    /// the output does not need to be delayed.
+    /// Network topology is (re)computed if necessary.
+    pub fn output_compensation(&mut self, channel: usize) -> usize {
+        assert!(channel < self.outputs());
+        if !self.is_ordered() {
+            self.determine_order();
+        }
+        self.output_delay[channel].delay()
     }
 
     /// Add a new unit to the network. Return its ID handle.
@@ -464,6 +538,9 @@ impl Net {
         unit.set_sample_rate(self.sample_rate as f64);
         core::mem::swap(&mut self.vertex[node_index].unit, &mut unit);
         self.vertex[node_index].changed = self.revision;
+        // The replacement may report a different latency or frequency
+        // response, so branch delay compensation must be recomputed.
+        self.invalidate_order();
         unit
     }
 
@@ -849,6 +926,192 @@ impl Net {
             self.error = Some(NetError::Cycle);
         }
         self.order = Some(order);
+        if self.delay_compensation {
+            self.update_delay_compensation();
+        } else {
+            self.clear_delay_compensation();
+        }
+    }
+
+    /// Extract the causal latency in samples represented by a routed signal.
+    /// Signals whose latency is unknown are treated as having zero latency,
+    /// which is a conservative choice: unknown branches are not delayed.
+    fn signal_latency(signal: Signal) -> f64 {
+        match signal {
+            Signal::Latency(l) | Signal::Response(_, l) => l,
+            _ => 0.0,
+        }
+    }
+
+    /// Round a latency in (possibly fractional) samples up to a whole-sample delay.
+    /// Rounding up guarantees that no branch is ever delayed by less than
+    /// its reported latency, which keeps every mix point sample-aligned.
+    fn round_delay(latency: f64) -> usize {
+        if latency <= 0.0 {
+            0
+        } else {
+            ceil(latency) as usize
+        }
+    }
+
+    /// Model a whole-sample compensation delay in signal analysis.
+    /// Unlike `Signal::delay`, this also applies the all-pass phase shift
+    /// to plain `Latency` signals and turns a unit input into a full
+    /// `Response`, so the reported latency and frequency response match
+    /// the delay line applied to the audio stream.
+    fn compensate_signal(signal: Signal, delay: f64, frequency: f64, sample_rate: f64) -> Signal {
+        let phase = -f64::TAU * frequency * delay / sample_rate;
+        match signal {
+            Signal::Response(response, latency) => Signal::Response(
+                response * Complex64::from_polar(1.0, phase),
+                latency + delay,
+            ),
+            Signal::Latency(latency) => {
+                Signal::Response(Complex64::from_polar(1.0, phase), latency + delay)
+            }
+            other => other.delay(delay),
+        }
+    }
+
+    /// Disable all compensation without deallocating the existing buffers,
+    /// so switching compensation back on again stays allocation-free on
+    /// the audio thread.
+    fn clear_delay_compensation(&mut self) {
+        self.output_delay
+            .resize_with(self.outputs(), DelayComp::default);
+        for vertex in self.vertex.iter_mut() {
+            vertex.compensated = false;
+            vertex
+                .input_delay
+                .resize_with(vertex.inputs(), DelayComp::default);
+            for line in vertex.input_delay.iter_mut() {
+                line.set_delay(0);
+            }
+            // Re-evaluate the zero-copy shortcut eligibility.
+            vertex.update_source_vertex();
+        }
+        for line in self.output_delay.iter_mut() {
+            line.set_delay(0);
+        }
+    }
+
+    /// Calculate branch delay compensation for the current topology and
+    /// configure the preallocated compensation lines accordingly.
+    /// Runs on the control thread; it never executes during audio processing.
+    fn update_delay_compensation(&mut self) {
+        // First make sure every vertex has one compensation line per input
+        // and every global output has one. Buffers start with zero capacity.
+        for vertex in self.vertex.iter_mut() {
+            vertex
+                .input_delay
+                .resize_with(vertex.inputs(), DelayComp::default);
+        }
+        self.output_delay
+            .resize_with(self.outputs(), DelayComp::default);
+
+        // Per-input-channel latency of the signal arriving at each vertex
+        // before compensation, in samples.
+        let mut input_latency: Vec<Vec<f64>> = self
+            .vertex
+            .iter()
+            .map(|vertex| vec![0.0; vertex.inputs()])
+            .collect();
+
+        let order = self.order.clone().unwrap_or_default();
+
+        // Routed signals at the output of each vertex. We reuse the routing
+        // analysis of the contained units to obtain both their processing
+        // latency and frequency responses.
+        let mut inner_signal: Vec<SignalFrame> = self
+            .vertex
+            .iter()
+            .map(|vertex| SignalFrame::new(vertex.outputs()))
+            .collect();
+        // Compensated latency of each output port of each vertex, in samples.
+        let mut port_latency: Vec<Vec<f64>> = self
+            .vertex
+            .iter()
+            .map(|vertex| vec![0.0; vertex.outputs()])
+            .collect();
+
+        for &node_index in order.iter() {
+            let inputs = self.vertex[node_index].inputs();
+            let mut input_signal = SignalFrame::new(inputs);
+            let mut max_input_latency = 0.0f64;
+            for channel in 0..inputs {
+                let signal = match self.vertex[node_index].source[channel].source {
+                    Port::Zero => Signal::Value(0.0),
+                    Port::Global(_) => Signal::Latency(0.0),
+                    Port::Local(source, port) => inner_signal[source].at(port),
+                };
+                let latency = Self::signal_latency(signal);
+                input_latency[node_index][channel] = latency;
+                max_input_latency = max(max_input_latency, latency);
+                input_signal.set(channel, signal);
+            }
+
+            // Route the uncompensated signals through the unit to learn
+            // its own processing latency and frequency response.
+            let output_signal = self.vertex[node_index].unit.route(&input_signal, 1.0);
+
+            // The unit's own latency at each output port is the routed
+            // latency minus the slowest uncompensated input. Generators
+            // (no inputs) simply report their routed latency as their own.
+            for port in 0..self.vertex[node_index].outputs() {
+                let routed = Self::signal_latency(output_signal.at(port));
+                let own = (routed - max_input_latency).max(0.0);
+                // After input alignment every input arrives at
+                // `max_input_latency`, so the compensated output port is
+                // delayed by that amount plus the unit's own latency.
+                port_latency[node_index][port] = max_input_latency + own;
+            }
+            inner_signal[node_index] = output_signal;
+        }
+
+        // Configure the input compensation lines. Every input is delayed
+        // so all inputs of a vertex reach the unit at the same time.
+        for &node_index in order.iter() {
+            let max_input_latency = input_latency[node_index].iter().copied().fold(0.0f64, max);
+            let vertex = &mut self.vertex[node_index];
+            vertex.compensated = false;
+            for channel in 0..vertex.inputs() {
+                let delay =
+                    Self::round_delay(max_input_latency - input_latency[node_index][channel]);
+                vertex.input_delay[channel].set_delay(delay);
+                if delay > 0 {
+                    vertex.compensated = true;
+                }
+            }
+        }
+
+        // Global output compensation: align all global outputs to the
+        // slowest one. Zero-sourced outputs stay silent and are not delayed.
+        let mut max_output_latency = 0.0f64;
+        let mut output_latency = vec![0.0f64; self.outputs()];
+        for channel in 0..self.outputs() {
+            let latency = match self.output_edge[channel].source {
+                Port::Zero => 0.0,
+                Port::Global(_) => 0.0,
+                Port::Local(node, port) => port_latency[node][port],
+            };
+            output_latency[channel] = latency;
+            if !matches!(self.output_edge[channel].source, Port::Zero) {
+                max_output_latency = max(max_output_latency, latency);
+            }
+        }
+        for channel in 0..self.outputs() {
+            let delay = if matches!(self.output_edge[channel].source, Port::Zero) {
+                0
+            } else {
+                Self::round_delay(max_output_latency - output_latency[channel])
+            };
+            self.output_delay[channel].set_delay(delay);
+        }
+
+        // Compensation may have changed zero-copy shortcut eligibility.
+        for vertex in self.vertex.iter_mut() {
+            vertex.update_source_vertex();
+        }
     }
 
     /// Determine node order in the supplied vector. Returns true if successful, false
@@ -1195,26 +1458,40 @@ impl Net {
         }
         // Iterate units in network order.
         for &node_index in self.order.get_or_insert(Vec::new()).iter() {
+            // Gather the uncompensated input samples.
             for channel in 0..self.vertex[node_index].inputs() {
-                match self.vertex[node_index].source[channel].source {
-                    Port::Zero => self.vertex[node_index].tick_input[channel] = 0.0,
-                    Port::Global(port) => self.vertex[node_index].tick_input[channel] = input[port],
-                    Port::Local(source, port) => {
-                        self.vertex[node_index].tick_input[channel] =
-                            self.vertex[source].tick_output[port]
-                    }
+                self.vertex[node_index].tick_input[channel] =
+                    match self.vertex[node_index].source[channel].source {
+                        Port::Zero => 0.0,
+                        Port::Global(port) => input[port],
+                        Port::Local(source, port) => self.vertex[source].tick_output[port],
+                    };
+            }
+            // Apply branch delay compensation. Zero-delay lines are skipped
+            // entirely, so an uncompensated network mixes exactly as before.
+            let vertex = &mut self.vertex[node_index];
+            for channel in 0..vertex.inputs() {
+                let delay = vertex.input_delay[channel].delay();
+                if delay > 0 {
+                    let sample = vertex.tick_input[channel];
+                    vertex.tick_input[channel] = vertex.input_delay[channel].tick(sample);
                 }
             }
-            let vertex = &mut self.vertex[node_index];
             vertex.tick(self.sample_rate, sender);
         }
 
         // Then we set the global outputs.
         for channel in 0..output.len() {
-            match self.output_edge[channel].source {
-                Port::Global(port) => output[channel] = input[port],
-                Port::Local(node, port) => output[channel] = self.vertex[node].tick_output[port],
-                Port::Zero => output[channel] = 0.0,
+            let sample = match self.output_edge[channel].source {
+                Port::Global(port) => input[port],
+                Port::Local(node, port) => self.vertex[node].tick_output[port],
+                Port::Zero => 0.0,
+            };
+            // Global output delay compensation. Zero-delay lines are skipped.
+            if self.output_delay[channel].delay() > 0 {
+                output[channel] = self.output_delay[channel].tick(sample);
+            } else {
+                output[channel] = sample;
             }
         }
     }
@@ -1232,10 +1509,15 @@ impl Net {
             self.determine_order();
         }
         let simd_size = simd_items(size);
+        // Block processing in this library never exceeds MAX_BUFFER_SIZE
+        // samples per call, which lets the compensation scratch live on
+        // the stack without allocation.
+        debug_assert!(size <= MAX_BUFFER_SIZE);
         // Iterate units in network order.
         for &node_index in self.order.as_ref().unwrap().iter() {
             if let Some((source_node, source_port)) = self.vertex[node_index].source_vertex {
                 // We can source inputs directly from a source vertex.
+                // This shortcut is only valid when no input is delay compensated.
                 let ptr = &mut self.vertex[source_node].output as *mut BufferVec;
                 let vertex = &mut self.vertex[node_index];
                 // Safety: we know there is no aliasing, as self connections are prohibited.
@@ -1249,9 +1531,11 @@ impl Net {
                 }
             } else {
                 let ptr = &mut self.vertex[node_index].input as *mut BufferVec;
-                // Gather inputs for this vertex.
+                // Gather inputs for this vertex and apply branch delay compensation.
                 for channel in 0..self.vertex[node_index].inputs() {
+                    let delay = self.vertex[node_index].input_delay[channel].delay();
                     // Safety: we know there is no aliasing, as self connections are prohibited.
+                    // Each channel is copied into its own disjoint buffer region.
                     unsafe {
                         match self.vertex[node_index].source[channel].source {
                             Port::Zero => (*ptr).channel_mut(channel)[..simd_size].fill(F32x::ZERO),
@@ -1262,6 +1546,18 @@ impl Net {
                                     &self.vertex[source].output.channel(port)[..simd_size],
                                 );
                             }
+                        }
+                        if delay > 0 {
+                            let buffer = &mut (*ptr).channel_f32_mut(channel);
+                            // Delay in place through a small stack scratch.
+                            // `MAX_BUFFER_SIZE` samples fit per channel.
+                            let mut scratch = [0.0f32; MAX_BUFFER_SIZE];
+                            scratch[..size].copy_from_slice(&buffer[..size]);
+                            self.vertex[node_index].input_delay[channel].process(
+                                size,
+                                &scratch[..size],
+                                &mut buffer[..size],
+                            );
                         }
                     }
                 }
@@ -1281,6 +1577,19 @@ impl Net {
                 Port::Local(node, port) => output.channel_mut(channel)[..simd_size]
                     .copy_from_slice(&self.vertex[node].output.channel(port)[..simd_size]),
                 Port::Zero => output.channel_mut(channel)[..simd_size].fill(F32x::ZERO),
+            }
+        }
+        // Apply global output delay compensation.
+        for channel in 0..output.channels() {
+            let delay = self.output_delay[channel].delay();
+            if delay > 0 {
+                let mut scratch = [0.0f32; MAX_BUFFER_SIZE];
+                scratch[..size].copy_from_slice(&output.channel_f32(channel)[..size]);
+                self.output_delay[channel].process(
+                    size,
+                    &scratch[..size],
+                    &mut output.channel_f32_mut(channel)[..size],
+                );
             }
         }
     }
@@ -1347,6 +1656,12 @@ impl AudioUnit for Net {
             // we cannot reset in the backend
             // - it may allocate or do something else inappropriate.
             vertex.changed = self.revision;
+            for line in vertex.input_delay.iter_mut() {
+                line.reset();
+            }
+        }
+        for line in self.output_delay.iter_mut() {
+            line.reset();
         }
         // Take the opportunity to unload some calculations.
         if !self.is_ordered() {
@@ -1396,14 +1711,25 @@ impl AudioUnit for Net {
         if !self.is_ordered() {
             self.determine_order();
         }
-        for &unit_index in self.order.as_mut().unwrap().iter() {
+        let sample_rate = self.sample_rate as f64;
+        let delay_compensation = self.delay_compensation;
+        for &unit_index in self.order.as_ref().unwrap().iter() {
             let mut input_signal = SignalFrame::new(self.vertex[unit_index].unit.inputs());
             for channel in 0..self.vertex[unit_index].unit.inputs() {
-                match self.vertex[unit_index].source[channel].source {
-                    Port::Local(j, port) => input_signal.set(channel, inner_signal[j].at(port)),
-                    Port::Global(j) => input_signal.set(channel, input.at(j)),
-                    Port::Zero => input_signal.set(channel, Signal::Value(0.0)),
+                let mut signal = match self.vertex[unit_index].source[channel].source {
+                    Port::Local(j, port) => inner_signal[j].at(port),
+                    Port::Global(j) => input.at(j),
+                    Port::Zero => Signal::Value(0.0),
+                };
+                // Account for the branch delay compensation applied at this input.
+                // The delay preserves the frequency response and shifts its phase.
+                if delay_compensation {
+                    let delay = self.vertex[unit_index].input_delay[channel].delay() as f64;
+                    if delay > 0.0 {
+                        signal = Self::compensate_signal(signal, delay, frequency, sample_rate);
+                    }
                 }
+                input_signal.set(channel, signal);
             }
             inner_signal[unit_index] = self.vertex[unit_index].unit.route(&input_signal, frequency);
         }
@@ -1411,13 +1737,19 @@ impl AudioUnit for Net {
         // Then we set the global outputs.
         let mut output_signal = SignalFrame::new(self.outputs());
         for channel in 0..self.outputs() {
-            match self.output_edge[channel].source {
-                Port::Global(port) => output_signal.set(channel, input.at(port)),
-                Port::Local(node, port) => {
-                    output_signal.set(channel, inner_signal[node].at(port));
+            let mut signal = match self.output_edge[channel].source {
+                Port::Global(port) => input.at(port),
+                Port::Local(node, port) => inner_signal[node].at(port),
+                Port::Zero => Signal::Value(0.0),
+            };
+            // Account for the global output delay compensation.
+            if delay_compensation {
+                let delay = self.output_delay[channel].delay() as f64;
+                if delay > 0.0 {
+                    signal = Self::compensate_signal(signal, delay, frequency, sample_rate);
                 }
-                Port::Zero => output_signal.set(channel, Signal::Value(0.0)),
             }
+            output_signal.set(channel, signal);
         }
         output_signal
     }
@@ -1432,6 +1764,16 @@ impl AudioUnit for Net {
         }
         for vertex in self.vertex.iter_mut() {
             vertex.allocate();
+            // Preallocate branch delay compensation lines for the delays
+            // required by the current topology. This runs on the control
+            // thread (at construction or commit time), never in the audio
+            // thread, so real-time processing stays allocation-free.
+            for line in vertex.input_delay.iter_mut() {
+                line.allocate(line.delay());
+            }
+        }
+        for line in self.output_delay.iter_mut() {
+            line.allocate(line.delay());
         }
     }
 }

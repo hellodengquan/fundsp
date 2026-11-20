@@ -333,7 +333,7 @@ pub trait AudioNode: Clone + Sync + Send {
     /// ```
     /// use fundsp::prelude64::*;
     /// assert_eq!(pass().latency(), Some(0.0));
-    /// assert_eq!(tick().latency(), Some(0.0));
+    /// assert_eq!(tick().latency(), Some(1.0));
     /// assert_eq!(sink().latency(), None);
     /// assert_eq!(lowpass_hz(440.0, 1.0).latency(), Some(0.0));
     /// assert_eq!(limiter(0.01, 0.01).latency(), Some(441.0));

@@ -11,6 +11,108 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
+/// Sample-accurate delay line used for branch delay compensation.
+/// The ring buffer is preallocated on the control thread, so the
+/// audio thread never has to allocate while compensating.
+#[derive(Clone, Default)]
+pub(crate) struct DelayComp {
+    /// Ring buffer of samples. Its length is `delay + 1`.
+    buffer: Vec<f32>,
+    /// Write index into the ring buffer.
+    index: usize,
+    /// Current delay in whole samples.
+    delay: usize,
+}
+
+impl DelayComp {
+    /// Create a new compensation line that is able to delay by up to `max_delay` samples.
+    pub fn new(max_delay: usize) -> Self {
+        let mut buffer = Vec::with_capacity(max_delay + 1);
+        buffer.resize(max_delay + 1, 0.0);
+        Self {
+            buffer,
+            index: 0,
+            delay: 0,
+        }
+    }
+
+    /// Current delay in whole samples.
+    #[inline]
+    pub fn delay(&self) -> usize {
+        self.delay
+    }
+
+    /// Reset the line to silence. The configured delay is retained.
+    pub fn reset(&mut self) {
+        self.index = 0;
+        self.buffer.fill(0.0);
+    }
+
+    /// Make sure the line can delay by at least `max_delay` samples.
+    /// Existing contents are cleared. This may allocate and is meant
+    /// to be called from the control thread only.
+    pub fn allocate(&mut self, max_delay: usize) {
+        if self.buffer.len() < max_delay + 1 {
+            self.buffer.resize(max_delay + 1, 0.0);
+        }
+        self.reset();
+    }
+
+    /// Set the active delay in whole samples.
+    ///
+    /// If the line has not been preallocated for this many samples, it is
+    /// grown and cleared here. Growing only happens while topology is being
+    /// (re)computed on the control thread; an already-allocated line never
+    /// allocates on the audio thread.
+    ///
+    /// The read position is reset to silence whenever the delay changes,
+    /// so shrinking a line (for example, when compensation is disabled)
+    /// cannot leave a stale read offset pointing into old data.
+    #[inline]
+    pub fn set_delay(&mut self, delay: usize) {
+        if delay + 1 > self.buffer.len() {
+            self.buffer.resize(delay + 1, 0.0);
+        }
+        if self.delay != delay {
+            self.index = 0;
+            self.buffer.fill(0.0);
+            self.delay = delay;
+        }
+    }
+
+    /// Delay one sample by the configured amount.
+    #[inline]
+    pub fn tick(&mut self, x: f32) -> f32 {
+        self.buffer[self.index] = x;
+        self.index += 1;
+        if self.index >= self.buffer.len() {
+            self.index = 0;
+        }
+        self.buffer[self.index]
+    }
+
+    /// Delay a block of `size` scalar samples.
+    /// Samples past `size` are zeroed so stale data never leaks through.
+    #[inline]
+    pub fn process(&mut self, size: usize, input: &[f32], output: &mut [f32]) {
+        debug_assert!(size <= input.len() && size <= output.len());
+        let length = self.buffer.len();
+        let mut index = self.index;
+        for i in 0..size {
+            self.buffer[index] = input[i];
+            index += 1;
+            if index >= length {
+                index = 0;
+            }
+            output[i] = self.buffer[index];
+        }
+        self.index = index;
+        for x in output[size..].iter_mut() {
+            *x = 0.0;
+        }
+    }
+}
+
 #[derive(Clone)]
 /// Individual AudioUnits are vertices in the graph.
 pub(crate) struct Vertex {
@@ -41,6 +143,13 @@ pub(crate) struct Vertex {
     /// This is set if all vertex inputs are sourced from successive outputs of the indicated node.
     /// We can then omit copying and use the source node outputs directly.
     pub source_vertex: Option<(NodeIndex, usize)>,
+    /// Branch delay compensation line for each input channel.
+    /// A line delays the incoming signal so that all inputs of the vertex
+    /// arrive sample-aligned at the mix point. Allocated on the control thread.
+    pub input_delay: Vec<DelayComp>,
+    /// Whether any input channel currently needs compensation.
+    /// When this is set the `source_vertex` zero-copy shortcut is not valid.
+    pub compensated: bool,
     /// Network revision in which this vertex was changed last.
     pub changed: u64,
     /// Used during order determination: number of unaccounted for outputs.
@@ -67,6 +176,8 @@ impl Vertex {
             next: NodeEdit::default(),
             latest: NodeEdit::default(),
             source_vertex: None,
+            input_delay: (0..inputs).map(|_| DelayComp::new(0)).collect(),
+            compensated: false,
             changed: 0,
             unplugged: 0,
             ordered: false,
@@ -98,6 +209,11 @@ impl Vertex {
     pub fn update_source_vertex(&mut self) {
         self.source_vertex = None;
         if self.inputs() == 0 {
+            return;
+        }
+        // Delay compensation changes the timing of inputs, so the zero-copy
+        // shortcut may only be used when every input is uncompensated.
+        if self.compensated {
             return;
         }
         let mut source_node = 0;

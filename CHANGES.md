@@ -5,6 +5,8 @@
 - `Sequencer` now supports looping. Some fixes were also made.
 - New `AudioNode` tree introspection system in the module `graph`.
 - In order to take effect, `Sequencer` changes must now be committed to the backend.
+- New optional branch delay compensation for `Net`. Enable it with `Net::set_delay_compensation(true)` to sample-align parallel branches that merge at a mix point, avoiding comb filtering from mismatched processing latencies. Compensation buffers are preallocated, so audio-thread processing stays allocation-free across graph commits.
+- `Delay` and `Tick` now report their true processing latency in signal routing and `AudioUnit::latency`.
 
 ### Version 0.23
 

@@ -118,11 +118,14 @@ pub(crate) struct Edit {
     pub fade_out: f64,
 }
 
+/// Apply a fade in to `output`, which contains block samples
+/// `start_index..end_index` starting at buffer index 0.
+/// The envelope is evaluated at the same absolute times as in `tick`,
+/// so the result is independent of the block size.
 #[inline]
 fn fade_in(
     sample_duration: f64,
     time: f64,
-    end_time: f64,
     start_index: usize,
     end_index: usize,
     ease: Fade,
@@ -130,84 +133,55 @@ fn fade_in(
     fade_start_time: f64,
     output: &mut BufferMut,
 ) {
-    let fade_end_time = fade_start_time + fade_duration;
-    if fade_duration > 0.0 && fade_end_time > time {
-        let fade_end_i = if fade_end_time >= end_time {
-            end_index
-        } else {
-            round((fade_end_time - time) / sample_duration) as usize
-        };
-        let fade_phase = delerp(
-            fade_start_time,
-            fade_end_time,
-            time + start_index as f64 * sample_duration,
-        ) as f32;
-        let fade_d = (sample_duration / fade_duration) as f32;
-        match ease {
-            Fade::Power => {
-                for channel in 0..output.channels() {
-                    let mut fade = fade_phase;
-                    for x in output.channel_f32_mut(channel)[..fade_end_i].iter_mut() {
-                        *x *= sine_ease(fade);
-                        fade += fade_d;
-                    }
-                }
-            }
-            Fade::Smooth => {
-                for channel in 0..output.channels() {
-                    let mut fade = fade_phase;
-                    for x in output.channel_f32_mut(channel)[..fade_end_i].iter_mut() {
-                        *x *= smooth5(fade);
-                        fade += fade_d;
-                    }
+    if fade_duration > 0.0 {
+        let fade_end_time = fade_start_time + fade_duration;
+        for channel in 0..output.channels() {
+            for (i, x) in output.channel_f32_mut(channel)[..end_index - start_index]
+                .iter_mut()
+                .enumerate()
+            {
+                let fade = delerp(
+                    fade_start_time,
+                    fade_end_time,
+                    time + (start_index + i) as f64 * sample_duration,
+                ) as f32;
+                if fade < 1.0 {
+                    *x *= ease.at(fade);
                 }
             }
         }
     }
 }
 
+/// Apply a fade out to `output`, which contains block samples
+/// `start_index..end_index` starting at buffer index 0.
+/// The envelope is evaluated at the same absolute times as in `tick`,
+/// so the result is independent of the block size.
 #[inline]
 fn fade_out(
     sample_duration: f64,
     time: f64,
-    end_time: f64,
-    _start_index: usize,
+    start_index: usize,
     end_index: usize,
     ease: Fade,
     fade_duration: f64,
     fade_end_time: f64,
     output: &mut BufferMut,
 ) {
-    let fade_start_time = fade_end_time - fade_duration;
-    if fade_duration > 0.0 && fade_start_time < end_time {
-        let fade_i = if fade_start_time <= time {
-            0
-        } else {
-            round((fade_start_time - time) / sample_duration) as usize
-        };
-        let fade_phase = delerp(
-            fade_start_time,
-            fade_end_time,
-            time + fade_i as f64 * sample_duration,
-        ) as f32;
-        let fade_d = (sample_duration / fade_duration) as f32;
-        match ease {
-            Fade::Power => {
-                for channel in 0..output.channels() {
-                    let mut fade = fade_phase;
-                    for x in output.channel_f32_mut(channel)[fade_i..end_index].iter_mut() {
-                        *x *= sine_ease(1.0 - fade);
-                        fade += fade_d;
-                    }
-                }
-            }
-            Fade::Smooth => {
-                for channel in 0..output.channels() {
-                    let mut fade = fade_phase;
-                    for x in output.channel_f32_mut(channel)[fade_i..end_index].iter_mut() {
-                        *x *= smooth5(1.0 - fade);
-                        fade += fade_d;
-                    }
+    if fade_duration > 0.0 {
+        let fade_start_time = fade_end_time - fade_duration;
+        for channel in 0..output.channels() {
+            for (i, x) in output.channel_f32_mut(channel)[..end_index - start_index]
+                .iter_mut()
+                .enumerate()
+            {
+                let fade = delerp(
+                    fade_start_time,
+                    fade_end_time,
+                    time + (start_index + i) as f64 * sample_duration,
+                ) as f32;
+                if fade > 0.0 {
+                    *x *= ease.at(1.0 - fade);
                 }
             }
         }
@@ -866,9 +840,16 @@ impl AudioUnit for Sequencer {
                 let end_index = if self.active[i].end_time >= end_time {
                     min(size, loop_size)
                 } else {
+                    // Match `tick`: a sample at time `t` is produced while
+                    // `end_time > t + 0.5 * sample_duration`.
                     min(
                         loop_size,
-                        round((self.active[i].end_time - self.time) * self.sample_rate) as usize,
+                        max(
+                            0.0,
+                            ceil(
+                                (self.active[i].end_time - self.time) * self.sample_rate - 0.5,
+                            ),
+                        ) as usize,
                     )
                 };
                 if end_index > start_index {
@@ -887,7 +868,6 @@ impl AudioUnit for Sequencer {
                     fade_in(
                         self.sample_duration,
                         self.time,
-                        end_time,
                         start_index,
                         end_index,
                         self.active[i].fade_ease.clone(),
@@ -898,7 +878,6 @@ impl AudioUnit for Sequencer {
                     fade_out(
                         self.sample_duration,
                         self.time,
-                        end_time,
                         start_index,
                         end_index,
                         self.active[i].fade_ease.clone(),
@@ -936,7 +915,7 @@ impl AudioUnit for Sequencer {
             let mut loop_output_tmp = BufferVec::new(0);
             core::mem::swap(&mut loop_output_tmp, &mut self.loop_output_buffer);
             for channel in 0..self.inputs() {
-                for j in loop_size - size..size {
+                for j in loop_size..size {
                     loop_input_tmp.set_f32(channel, j - loop_size, input.at_f32(channel, j));
                 }
             }
@@ -944,7 +923,7 @@ impl AudioUnit for Sequencer {
             let output_ref = &mut loop_output_tmp.buffer_mut();
             self.process(size - loop_size, input_ref, output_ref);
             for channel in 0..self.outputs() {
-                for j in loop_size - size..size {
+                for j in loop_size..size {
                     output.set_f32(channel, j, output_ref.at_f32(channel, j - loop_size));
                 }
             }
@@ -1004,6 +983,154 @@ mod tests {
     use prelude64::sine_hz;
 
     use super::*;
+
+    /// Deterministic test unit whose `process` is exactly repeated `tick`,
+    /// so sequencer level scheduling can be compared sample for sample.
+    #[derive(Clone)]
+    struct Ramp {
+        phase: f32,
+    }
+
+    impl Ramp {
+        fn new() -> Self {
+            Self { phase: 0.0 }
+        }
+    }
+
+    impl AudioUnit for Ramp {
+        fn reset(&mut self) {
+            self.phase = 0.0;
+        }
+        fn tick(&mut self, _input: &[f32], output: &mut [f32]) {
+            self.phase += 0.013;
+            output[0] = self.phase.sin();
+        }
+        fn process(&mut self, size: usize, _input: &BufferRef, output: &mut BufferMut) {
+            let mut sample = [0.0f32; 1];
+            for i in 0..size {
+                self.tick(&[], &mut sample);
+                output.set_f32(0, i, sample[0]);
+            }
+        }
+        fn inputs(&self) -> usize {
+            0
+        }
+        fn outputs(&self) -> usize {
+            1
+        }
+        fn route(&mut self, input: &SignalFrame, _frequency: f64) -> SignalFrame {
+            Routing::Generator(0.0).route(input, 1)
+        }
+        fn get_id(&self) -> u64 {
+            0x5eed
+        }
+        fn footprint(&self) -> usize {
+            core::mem::size_of::<Self>()
+        }
+    }
+
+    // A power of two sample rate makes sample durations exact in floating point,
+    // so we can demand bitwise identical output between `tick` and `process`.
+    const TEST_SR: f64 = 65536.0;
+
+    fn render_tick(unit: &mut dyn AudioUnit, n: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(n);
+        let mut sample = [0.0f32; 1];
+        for _ in 0..n {
+            unit.tick(&[], &mut sample);
+            out.push(sample[0]);
+        }
+        out
+    }
+
+    fn render_process(unit: &mut dyn AudioUnit, n: usize, block: usize) -> Vec<f32> {
+        let input = BufferVec::new(0);
+        let input_ref = input.buffer_ref();
+        let mut buffer = BufferVec::new(1);
+        let mut out = Vec::with_capacity(n);
+        let mut i = 0;
+        while i < n {
+            let size = min(block, n - i);
+            let mut buffer_mut = buffer.buffer_mut();
+            unit.process(size, &input_ref, &mut buffer_mut);
+            for j in 0..size {
+                out.push(buffer_mut.at_f32(0, j));
+            }
+            i += size;
+        }
+        out
+    }
+
+    /// Events with fades that start and end at arbitrary (mid-block) positions.
+    fn build_arrangement(mode: ReplayMode) -> Sequencer {
+        let mut seq = Sequencer::new(0, 1, mode);
+        seq.set_sample_rate(TEST_SR);
+        seq.push(0.0, 0.008, Fade::Smooth, 0.002, 0.002, Box::new(Ramp::new()));
+        seq.push(0.001, 0.011, Fade::Smooth, 0.003, 0.004, Box::new(Ramp::new()));
+        seq.push(0.005, 0.02, Fade::Power, 0.004, 0.005, Box::new(Ramp::new()));
+        // Ends exactly halfway between two samples.
+        seq.push(
+            0.004,
+            400.5 / TEST_SR,
+            Fade::Smooth,
+            0.001,
+            0.001,
+            Box::new(Ramp::new()),
+        );
+        seq
+    }
+
+    #[test]
+    fn process_matches_tick() {
+        const N: usize = 3000;
+        let mut reference = build_arrangement(ReplayMode::None);
+        let expected = render_tick(&mut reference, N);
+        for block in [1usize, 2, 3, 5, 8, 13, 32, 63, 64] {
+            let mut seq = build_arrangement(ReplayMode::None);
+            let got = render_process(&mut seq, N, block);
+            assert_eq!(expected, got, "block size {block}");
+        }
+    }
+
+    /// Looping arrangement with an event straddling the loop point.
+    fn build_loop_arrangement() -> Sequencer {
+        let mut seq = Sequencer::new(0, 1, ReplayMode::Loop(0.02));
+        seq.set_sample_rate(TEST_SR);
+        // Straddles the loop point at 0.02.
+        seq.push(0.015, 0.025, Fade::Smooth, 0.002, 0.002, Box::new(Ramp::new()));
+        // Plays once per loop.
+        seq.push(0.003, 0.009, Fade::Power, 0.001, 0.002, Box::new(Ramp::new()));
+        seq
+    }
+
+    #[test]
+    fn process_matches_tick_loop() {
+        const N: usize = 5000;
+        let mut reference = build_loop_arrangement();
+        let expected = render_tick(&mut reference, N);
+        for block in [1usize, 7, 16, 37, 64] {
+            let mut seq = build_loop_arrangement();
+            let got = render_process(&mut seq, N, block);
+            assert_eq!(expected, got, "block size {block}");
+        }
+    }
+
+    #[test]
+    fn backend_matches_tick() {
+        const N: usize = 5000;
+        let mut reference = build_loop_arrangement();
+        let expected = render_tick(&mut reference, N);
+        for block in [1usize, 7, 16, 37, 64] {
+            let mut front = Sequencer::new(0, 1, ReplayMode::Loop(0.02));
+            front.set_sample_rate(TEST_SR);
+            let mut back = front.backend();
+            front.push(0.015, 0.025, Fade::Smooth, 0.002, 0.002, Box::new(Ramp::new()));
+            front.push(0.003, 0.009, Fade::Power, 0.001, 0.002, Box::new(Ramp::new()));
+            front.commit();
+            let got = render_process(&mut back, N, block);
+            assert_eq!(expected, got, "block size {block}");
+        }
+    }
 
     #[test]
     fn reset_replays_events() {

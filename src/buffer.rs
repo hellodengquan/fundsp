@@ -130,8 +130,8 @@ impl<'a> BufferMut<'a> {
     /// Create a sub-span of this buffer.
     pub fn span(&self, start: usize, length: usize, target: &mut BufferVec) {
         for channel in 0..self.channels() {
-            for i in start..length {
-                target.set_f32(channel, i - start, self.at_f32(channel, start));
+            for i in start..start + length {
+                target.set_f32(channel, i - start, self.at_f32(channel, i));
             }
         }
     }
@@ -215,8 +215,8 @@ impl<'a> BufferRef<'a> {
     /// Create a sub-span of this buffer.
     pub fn span(&self, start: usize, length: usize, target: &mut BufferVec) {
         for channel in 0..self.channels() {
-            for i in start..length {
-                target.set_f32(channel, i - start, self.at_f32(channel, start));
+            for i in start..start + length {
+                target.set_f32(channel, i - start, self.at_f32(channel, i));
             }
         }
     }
